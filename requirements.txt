@@ -1,0 +1,11 @@
+transformers
+huggingface_hub
+accelerate
+bitsandbytes
+datasets
+timm
+torch
+torchvision
+peft
+tqdm
+matplotlib

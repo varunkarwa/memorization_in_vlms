@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 import numpy as np
 from tqdm.auto import tqdm
 
@@ -18,7 +18,8 @@ from sentence_transformers import SentenceTransformer
 import nltk
 nltk.download('wordnet', quiet=True)
 from nltk.corpus import wordnet
-#Official DocVQA Evluation Metric: ANLS
+
+# Official VQA-RAD Evaluation Metric: ANLS (adapted for single answer)
 
 def _normalize(s: str) -> str:
     if not s:
@@ -41,24 +42,24 @@ def _levenshtein(s1, s2):
         previous = current
     return previous[-1]
 
-def anls(pred: str, gts: list, threshold: float = 0.0) -> float:
+def anls(pred: str, gt: str, threshold: float = 0.0) -> float:
     pred = _normalize(pred)
-    if not gts:
+    gt = _normalize(gt)
+    if not gt:
         return 1.0 if not pred else 0.0
-    sims = [1.0 - _levenshtein(pred, _normalize(gt)) / max(len(pred), len(_normalize(gt))) for gt in gts]
-    sim = max(sims)
+    sim = 1.0 - _levenshtein(pred, gt) / max(len(pred), len(gt))
     return sim if sim >= threshold else 0.0
 
 
 def collate_fn(batch: List[Dict], processor) -> Dict:
     """
     Identical to the one used during training.
-    - Input: list of dicts with 'image', 'question', 'answers'
+    - Input: list of dicts with 'image', 'question', 'answer'
     - Output: batched inputs with labels masked
     """
     images = [ex["image"] for ex in batch]
     questions = [ex["question"] for ex in batch]
-    answers = [ex["answers"][0] for ex in batch]  # take first answer
+    answers = [ex["answer"] for ex in batch]  # single answer
     prompts = [f"<image> {q}" for q in questions]
     texts = [f"{p} {a}" for p, a in zip(prompts, answers)]
 
@@ -87,19 +88,19 @@ def load_model_and_processor(model_path: str, device: str):
     processor = AutoProcessor.from_pretrained(model_path, tokenizer_kwargs={"padding_side": "left"})
     model = AutoModelForImageTextToText.from_pretrained(
         model_path,
-        dtype = torch.bfloat16,
+        torch_dtype = torch.bfloat16,
         device_map = "auto",)
     model.eval()
     return model, processor
 
-def load_docvqa():
-    val_ds = load_dataset("lmms-lab/docvqa", "DocVQA", split="validation")
-    test_ds = load_dataset("lmms-lab/docvqa", "DocVQA", split="test")
+def load_vqa_rad():
+    val_ds = load_dataset("flaviagiammarino/vqa-rad", split="train")
+    test_ds = load_dataset("flaviagiammarino/vqa-rad", split="test")
 
     def _preprocess(ex):
         ex["image"] = ex["image"].convert("RGB")
         ex["question"] = ex["question"]
-        ex["answers"] = ex["answers"] if isinstance(ex["answers"], list) else [ex["answers"]]
+        ex["answer"] = ex["answer"]  # single string
         return ex
 
     val_ds = val_ds.map(_preprocess)
@@ -108,34 +109,38 @@ def load_docvqa():
     return val_ds, test_ds
 
 @torch.no_grad()
-def compute_ucr(dataset,model,processor, batch_size=8,noise_std=0.25, mask_prb=0.3):
+def compute_ucr(dataset,model,processor, batch_size=1,noise_std=0.25, mask_prb=0.3):  # Reduced batch_size
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x, processor), num_workers=0, pin_memory=True)
     correct, total = 0,0
 
     for batch in tqdm(loader, desc="Evaluating UCR"):
-        pixel_values = batch['pixel_values'].to(model.device)
+        with torch.inference_mode():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                pixel_values = batch['pixel_values'].to(model.device)
 
-        noise = torch.randn_like(pixel_values) * noise_std
-        corrupted_images = torch.clamp(pixel_values + noise,0,1)
-        mask = torch.rand_like(pixel_values[:,:1]) > mask_prb
-        corrupted_images = corrupted_images*mask + pixel_values*(~mask)
+                noise = torch.randn_like(pixel_values) * noise_std
+                corrupted_images = torch.clamp(pixel_values + noise,0,1)
+                mask = torch.rand_like(pixel_values[:,:1]) > mask_prb
+                corrupted_images = corrupted_images*mask + pixel_values*(~mask)
 
-        batch["pixel_values"] = corrupted_images
-        batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                batch["pixel_values"] = corrupted_images
+                batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-        gen_ids = model.generate(
-            **{k: v for k, v in batch.items() if k in ["pixel_values", "input_ids", "attention_mask"]},
-            max_new_tokens=32,
-            do_sample=False,
-        )
-        preds = processor.batch_decode(gen_ids, skip_special_tokens=True)
+                torch.cuda.empty_cache()  # Clear cache before generate
 
-        for pred, ex in zip(preds, batch["original_examples"]):
-            pred = pred.split("<image>")[-1].strip()
-            score = anls(pred, ex["answers"])
-            if score > 0.5:
-                correct += 1
-            total += 1
+                gen_ids = model.generate(
+                    **{k: v for k, v in batch.items() if k in ["pixel_values", "input_ids", "attention_mask"]},
+                    max_new_tokens=16,  # Reduced from 32
+                    do_sample=False,
+                )
+                preds = processor.batch_decode(gen_ids, skip_special_tokens=True)
+
+                for pred, ex in zip(preds, batch["original_examples"]):
+                    pred = pred.split("<image>")[-1].strip()
+                    score = anls(pred, ex["answer"])
+                    if score > 0.5:
+                        correct += 1
+                    total += 1
         
     ucr = correct / total if total > 0 else 0.0
     return ucr
@@ -154,7 +159,7 @@ def _synonym_replace(text:str,prob:float=0.3):
     return " ".join(out)
 
 @torch.no_grad()
-def compute_ppr(dataset, model, processor, batch_size=8, pertrub_prob=0.3):
+def compute_ppr(dataset, model, processor, batch_size=1, pertrub_prob=0.3):  # Reduced batch_size
     def _accuracy(perturbed: bool):
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x, processor), pin_memory=True, num_workers=0)
         correct,total = 0,0
@@ -170,19 +175,23 @@ def compute_ppr(dataset, model, processor, batch_size=8, pertrub_prob=0.3):
 
         batch = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-        gen_ids = model.generate(
-            **{k: v for k, v in batch.items() if k in ["pixel_values", "input_ids", "attention_mask"]},
-            max_new_tokens=32,
-            do_sample=False,
-        )
-        preds = processor.batch_decode(gen_ids, skip_special_tokens=True)
+        torch.cuda.empty_cache()  # Clear cache before generate
 
-        for pred, ex in zip(preds, batch["original_examples"]):
-            pred = pred.split("<image>")[-1].strip()
-            score = anls(pred, ex["answers"])
-            if score >= 0.5:
-                correct += 1
-            total += 1
+        with torch.inference_mode():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                gen_ids = model.generate(
+                    **{k: v for k, v in batch.items() if k in ["pixel_values", "input_ids", "attention_mask"]},
+                    max_new_tokens=16,  # Reduced from 32
+                    do_sample=False,
+                )
+                preds = processor.batch_decode(gen_ids, skip_special_tokens=True)
+
+                for pred, ex in zip(preds, batch["original_examples"]):
+                    pred = pred.split("<image>")[-1].strip()
+                    score = anls(pred, ex["answer"])
+                    if score >= 0.5:
+                        correct += 1
+                    total += 1
         return correct / total if total > 0 else 0.0
     
     baseline_acc = _accuracy(perturbed=False)
@@ -190,36 +199,36 @@ def compute_ppr(dataset, model, processor, batch_size=8, pertrub_prob=0.3):
     return math.log(perturbed_acc/baseline_acc) if baseline_acc > 0 else float('-inf')
 
 @torch.no_grad()
-def compute_emr(train_dataset, model, processor, top_k=5, paraphrase_thres=0.88):
+def compute_emr(train_dataset, model, processor, top_k=1, paraphrase_thres=0.88):
     clip = SentenceTransformer('clip-ViT-B-32')
     exact, paraph, total = 0, 0, 0
 
     for ex in tqdm(train_dataset, desc="Encoding training questions for EMR"):
         img = ex["image"]
         question = ex["question"]
-        gts = [a.lower() for a in ex["answers"]]
+        gt = ex["answer"].lower()
 
-        imputs = processor(
+        inputs = processor(
             images=img,
             text=f"<image> {question}",
             return_tensors="pt").to(model.device)
         gen_ids = model.generate(
-            **imputs,
-            max_new_tokens=32,
+            **inputs,
+            max_new_tokens=16,  # Reduced from 32
             do_sample=False,
             num_return_sequences=top_k,
         )
         gens = processor.batch_decode(gen_ids, skip_special_tokens=True)
         preds = [g.split("<image>")[-1].strip().lower() for g in gens]
 
-        if any(p == g for p in preds for g in gts):
+        if any(p == gt for p in preds):
             exact += 1
         elif any(
             torch.cosine_similarity(
                 clip.encode(p, convert_to_tensor=True).unsqueeze(0),
-                clip.encode(g, convert_to_tensor=True).unsqueeze(0)
+                clip.encode(gt, convert_to_tensor=True).unsqueeze(0)
             ).item() > paraphrase_thres
-            for p in preds for g in gts
+            for p in preds
         ):
             paraph += 1
         total += 1
@@ -227,9 +236,9 @@ def compute_emr(train_dataset, model, processor, top_k=5, paraphrase_thres=0.88)
     return exact/total , (exact + paraph)/total
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Memorization Metrics on DocVQA")
+    parser = argparse.ArgumentParser(description="Evaluate Memorization Metrics on VQA-RAD")
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=1)  # Reduced default
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
@@ -237,23 +246,23 @@ def main():
 
     model, processor = load_model_and_processor(args.model_path, args.device)
     
-    print("Loading DocVQA (validation = your train, test = held-out)...")
-    train_ds, val_ds = load_docvqa()
+    print("Loading VQA-RAD (train = your train, test = held-out)...")
+    train_ds, val_ds = load_vqa_rad()
 
     results = {}
 
     # UCR
-    print("\n=== Computing UCR (on test subset) ===")
+    print("\n=== Computing UCR (on full test set) ===")
     ucr = compute_ucr(val_ds, model, processor, batch_size=args.batch_size)
     results["UCR"] = ucr
 
     # PPR
-    print("\n=== Computing PPR (on test subset) ===")
+    print("\n=== Computing PPR (on full test set) ===")
     ppr = compute_ppr(val_ds, model, processor, batch_size=args.batch_size)
     results["PPR"] = ppr
 
     # EMR
-    print("\n=== Computing EMR (on your training split: validation) ===")
+    print("\n=== Computing EMR (on your training split: train) ===")
     emr_exact, emr_paraph = compute_emr(train_ds, model, processor)
     results["EMR_exact"] = emr_exact
     results["EMR_paraphrase"] = emr_paraph

@@ -1,0 +1,2 @@
+Python version: 3.6.8
+Pip version: Error checking pip version: __init__() got an unexpected keyword argument 'text'

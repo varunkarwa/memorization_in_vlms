@@ -1,73 +1,104 @@
 #!/bin/bash
-#SBATCH -t 72:00:00          # 4 hours
-#SBATCH --gres=gpu:4         # request 1 GPU
-#SBATCH --mem=256G            # 125 GB CPU RAM
+#SBATCH -t 72:00:00
+#SBATCH --gres=gpu:4
+#SBATCH --mem=256G
 #SBATCH --cpus-per-task=4
 #SBATCH -J FinetuneVLM
 #SBATCH --mail-type=END,FAIL
-#SBATCH -n 4
-#SBATCH -N 1
+#SBATCH -n 4               # must equal number of GPUs
+#SBATCH -N 1               # single node ONLY
 
-# module avail python     # see available versions
+# -------------------------------
+# 1. Modules & Conda
+# -------------------------------
 module purge
-module load python/3.10 # or 3.9/3.11 if available
-
-# Load Anaconda
+module load python/3.10
 module load anaconda3/latest
+module load cuda/12.8
+source $ANACONDA_HOME/etc/profile.d/conda.sh
 
-# Initialize conda in this job
-. $ANACONDA_HOME/etc/profile.d/conda.sh
+ENV_NAME=finetune_vlm
 
-#conda create -n finetune python=3.10 -y
-
-# Activate your environment (replace "finetune" with your env name)
-conda activate finetune
-
-if [ ! -f "$HOME/.cache/finetune_reqs_installed" ]; then
-    echo "Installing Python packages..."
-    pip install --upgrade pip
-
-    # Install from requirements.txt
-    pip install -r requirements.txt
-
-    # === CRITICAL: Install PyTorch Nightly for B200 (sm_100) ===
-    pip uninstall -y torch torchvision torchaudio
-    pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu124
-
-    touch "$HOME/.cache/finetune_reqs_installed"
-    echo "Dependencies installed."
-else
-    echo "Dependencies already installed. Skipping."
+if ! conda env list | grep -q "^$ENV_NAME "; then
+    echo "Creating conda env $ENV_NAME ..."
+    conda create -y -n $ENV_NAME python=3.10
 fi
 
-# Make sure pip installs packages to your user space (avoids permission errors)
-# pip3 install -r requirements.txt
-export MASTER_ADDR=$(hostname -s)     # short hostname
-export MASTER_PORT=29500
-export WORLD_SIZE=$SLURM_NTASKS       # 4
-export RANK=$SLURM_PROCID             # 0,1,2,3
-export LOCAL_RANK=$SLURM_LOCALID      # 0,1,2,3
+conda activate $ENV_NAME
 
-# Ensure each process sees only its GPU
-export CUDA_VISIBLE_DEVICES=$SLURM_LOCALID
+# -------------------------------
+# 2. Install dependencies once
+# -------------------------------
+CACHE_DIR=$HOME/.cache/torch_wheels
+mkdir -p $CACHE_DIR
 
-# Debug
-echo "=== SLURM Job Info ==="
-echo "Node: $(hostname)"
-echo "GPUs: $SLURM_GPUS_ON_NODE"
-echo "Tasks: $SLURM_NTASKS"
-echo "ProcID: $SLURM_PROCID"
-echo "LocalID: $SLURM_LOCALID"
-echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
-echo "MASTER_ADDR: $MASTER_ADDR"
-echo "MASTER_PORT: $MASTER_PORT"
-echo "========================"
+if [ ! -f "$HOME/.cache/${ENV_NAME}_installed_ok" ]; then
+    echo "Installing dependencies..."
 
-# ==============================
-# 4. Launch Training with srun
-# ==============================
-srun --cpu-bind=v --accel-bind=g \
-     python finetuning.py
+    pip install --upgrade pip setuptools wheel
+    pip install -r requirements.txt
 
-# Deactivate
+    pip uninstall -y torch torchvision torchaudio
+
+    # Install correct PyTorch nightly for Blackwell
+    pip install --pre torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/nightly/cu128 \
+        --extra-index-url https://download.pytorch.org/whl/nightly \
+        -t $CACHE_DIR
+
+    pip install $CACHE_DIR/torch-*.whl \
+        $CACHE_DIR/torchvision-*.whl \
+        $CACHE_DIR/torchaudio-*.whl \
+        --no-index --find-links $CACHE_DIR
+
+    pip install bitsandbytes==0.43.3
+
+    touch "$HOME/.cache/${ENV_NAME}_installed_ok"
+    echo "Dependencies installed."
+fi
+
+# -------------------------------
+# 3. Verify GPUs
+# -------------------------------
+python - <<'EOF'
+import torch
+print("PyTorch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("GPUs:", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    print(f"GPU[{i}]:", torch.cuda.get_device_name(i))
+EOF
+
+# -------------------------------
+# 4. Proper DDP environment
+# -------------------------------
+# MASTER_ADDR = first node hostname
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)
+
+# Use a random port to avoid EADDRINUSE
+export MASTER_PORT=$((10000 + RANDOM % 50000))
+
+# WORLD_SIZE = total tasks (1 task per GPU)
+export WORLD_SIZE=$SLURM_NTASKS
+export RANK=$SLURM_PROCID
+export LOCAL_RANK=$SLURM_LOCALID
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+echo "MASTER_ADDR=$MASTER_ADDR"
+echo "MASTER_PORT=$MASTER_PORT"
+echo "WORLD_SIZE=$WORLD_SIZE  RANK=$RANK  LOCAL_RANK=$LOCAL_RANK"
+
+# -------------------------------
+# 5. Launch training
+# -------------------------------
+echo "Starting training with 4 DDP processes..."
+
+# Important: srun must NOT override env vars → use --export=ALL
+srun --export=ALL \
+     --cpu-bind=v \
+     --accel-bind=g \
+     python webqa_finetuning.py
+
+echo "Done."
 conda deactivate

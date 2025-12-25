@@ -9,95 +9,75 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --output=eval_mem_%j.out
 #SBATCH --error=eval_mem_%j.err
-
 # ------------------------------------------------------------------
 # 0. PATHS
 # ------------------------------------------------------------------
 THESIS_DIR="/home/jef08min/Thesis"
-EVAL_SCRIPT="${THESIS_DIR}/evaluationmemorization.py"
-MODEL_PATH="${THESIS_DIR}/finetuned_docvqa/epoch3"
-
+EVAL_SCRIPT="${THESIS_DIR}/blipevaluation.py"
+MODEL_PATH="${THESIS_DIR}/finetuned_mem_analysis/ckpt_epoch_10"
 # ------------------------------------------------------------------
 # 1. Environment
 # ------------------------------------------------------------------
 module purge
 module load python/3.10
 module load anaconda3/latest
-
 source $ANACONDA_HOME/etc/profile.d/conda.sh
+
+echo "Activating environment..."
 conda activate finetune
 
 # ------------------------------------------------------------------
-# 2. INSTALL LATEST PYTORCH NIGHTLY + TORCHVISION
+# 2. CHECK GPU
 # ------------------------------------------------------------------
-echo "Installing latest PyTorch nightly + torchvision..."
-
-pip uninstall -y torch torchvision torchaudio timm 2>/dev/null || true
-
-# Install LATEST nightly (no version pinning)
-pip install --pre torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/nightly/cu124
-
-pip install timm
+echo "Checking GPU visibility..."
+nvidia-smi
+python -c "import torch; print(f'Torch: {torch.__version__}, CUDA: {torch.version.cuda}, GPU: {torch.cuda.is_available()}')"
 
 # ------------------------------------------------------------------
-# 3. VERIFY TORCHVISION
+# 3. VERIFY FILES
 # ------------------------------------------------------------------
-python - <<'PY'
-import torch, torchvision, timm
-print(f"torch: {torch.__version__}")
-print(f"torchvision: {torchvision.__version__}")
-print(f"timm: {timm.__version__}")
-print(f"GPU: {torch.cuda.get_device_name(0)}")
-PY
-
-# ------------------------------------------------------------------
-# 4. FIX MODEL LOADING IN SCRIPT
-# ------------------------------------------------------------------
-# Replace AutoModelForCausalLM → AutoModelForImageTextToText
-if grep -q "AutoModelForCausalLM" "$EVAL_SCRIPT"; then
-    echo "Fixing model class: AutoModelForCausalLM → AutoModelForImageTextToText"
-    sed -i 's/AutoModelForCausalLM/AutoModelForImageTextToText/g' "$EVAL_SCRIPT"
-fi
-
-# Fix torch_dtype → dtype
-if grep -q "torch_dtype=" "$EVAL_SCRIPT"; then
-    echo "Fixing torch_dtype → dtype"
-    sed -i 's/torch_dtype=/dtype=/g' "$EVAL_SCRIPT"
-fi
-
-# ------------------------------------------------------------------
-# 5. Verify model
-# ------------------------------------------------------------------
-if [ ! -d "$MODEL_PATH" ]; then
-    echo "ERROR: Model not found: $MODEL_PATH"
-    ls -la "${THESIS_DIR}/finetuned_docvqa/" || true
+if [ ! -f "$EVAL_SCRIPT" ]; then
+    echo "ERROR: Python script not found at $EVAL_SCRIPT"
+    echo "Please save the python code from the previous chat as 'memorization_evaluation.py'"
     exit 1
 fi
-echo "Model: $MODEL_PATH"
+
+if [ ! -d "$MODEL_PATH" ]; then
+    echo "WARNING: Model folder not found at $MODEL_PATH"
+    echo "Please check the MODEL_PATH variable in this script."
+    # We exit here because running without a model will fail
+    exit 1
+fi
 
 # ------------------------------------------------------------------
-# 6. Run evaluation
+# 4. RUN EVALUATION
 # ------------------------------------------------------------------
 cd "$THESIS_DIR"
+echo "Starting evaluation logic..."
+echo "Model: $MODEL_PATH"
 
-echo "Starting evaluation..."
+# Run the python script
+# Note: We removed --batch_size from arguments because the new script 
+# handles batching internally, but you can add it back if you modified the parser.
 python "$EVAL_SCRIPT" \
-    --model_path "$MODEL_PATH" \
-    --batch_size 8
+    --model_path "$MODEL_PATH"
 
 # ------------------------------------------------------------------
-# 7. Print results
+# 5. PRINT RESULTS
 # ------------------------------------------------------------------
-RESULTS="${MODEL_PATH}/memorisation_results.json"
-if [ -f "$RESULTS" ]; then
+RESULTS_FILE="final_memorization_metrics.json"
+
+if [ -f "$RESULTS_FILE" ]; then
     echo ""
-    echo "MEMORIZATION RESULTS"
     echo "===================================="
-    cat "$RESULTS" | python -m json.tool
+    echo "       MEMORIZATION RESULTS         "
+    echo "===================================="
+    cat "$RESULTS_FILE"
+    echo ""
     echo "===================================="
 else
-    echo "Results missing: $RESULTS"
+    echo "Evaluation finished, but $RESULTS_FILE was not found."
+    echo "Check the python logs above for errors."
 fi
 
 conda deactivate

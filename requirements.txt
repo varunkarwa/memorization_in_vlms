@@ -1,11 +1,11 @@
-transformers
-huggingface_hub
-accelerate
-bitsandbytes
+transformers>=4.36.0
+huggingface-hub
+accelerate>=0.25.0
+bitsandbytes>=0.41.0
 datasets
 timm
 torch
 torchvision
-peft
-tqdm
+peft>=0.7.0
 matplotlib
+scipy
